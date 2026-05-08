@@ -57,7 +57,7 @@ STAGE_STEP = {
     "audio": 3,
 }
 
-# Words that should not appear in a story for young children.
+# Words and phrases that should not appear in a story for young children.
 UNSAFE_KEYWORDS = [
     "kill", "killed", "killing", "murder", "murdered",
     "blood", "bloody", "gun", "shoot", "shot", "weapon",
@@ -69,6 +69,9 @@ UNSAFE_KEYWORDS = [
     "drug", "drugs", "cocaine", "heroin", "drunk", "alcohol",
     "suicide", "suicidal",
     "racist", "racism",
+    "monster", "monsters", "revenge", "curse", "cursed",
+    "black magic", "fall in love", "fell in love", "married", "marry",
+    "romance", "romantic",
 ]
 
 # Used if every generation attempt fails the safety check.
@@ -193,33 +196,66 @@ def inject_css():
 # ---------- Helpers ----------
 
 def is_safe_for_kids(text):
-    """Return True if no blacklisted word appears in the text as a whole word."""
+    """Return True if no blacklisted word or phrase appears in the text."""
     text_lower = text.lower()
+
     for word in UNSAFE_KEYWORDS:
-        if re.search(r"\b" + re.escape(word) + r"\b", text_lower):
-            return False
+        if " " in word:
+            if word in text_lower:
+                return False
+        else:
+            if re.search(r"\b" + re.escape(word) + r"\b", text_lower):
+                return False
+
     return True
+
+
+def count_words(text):
+    """Count words in a generated story."""
+    return len(re.findall(r"\b[A-Za-z]+(?:'[A-Za-z]+)?\b", text))
+
+
+def finish_sentence(text):
+    """Make sure the story ends with a complete sentence."""
+    text = text.strip()
+
+    if not text:
+        return text
+
+    if text.endswith((".", "!", "?")):
+        return text
+
+    last_sentence_end = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
+
+    if last_sentence_end > len(text) * 0.55:
+        return text[: last_sentence_end + 1].strip()
+
+    return text.rstrip(",;: ") + "."
 
 
 def trim_to_word_range(text, min_words=50, max_words=100):
     """Force the story length into the [min_words, max_words] range.
 
     If too long, truncate at the last sentence boundary inside the window.
-    If too short, append friendly closing sentences until it's long enough.
+    If too short, append friendly closing sentences until it is long enough.
     """
+    text = finish_sentence(text)
     words = text.split()
 
     if len(words) > max_words:
         truncated = " ".join(words[:max_words])
         cut_idx = -1
+
         for punct in [".", "!", "?"]:
             idx = truncated.rfind(punct)
             if idx > len(truncated) * 0.6 and idx > cut_idx:
                 cut_idx = idx
+
         if cut_idx > 0:
             truncated = truncated[: cut_idx + 1]
         else:
             truncated = truncated.rstrip(",;: ") + "."
+
         text = truncated
         words = text.split()
 
@@ -231,35 +267,80 @@ def trim_to_word_range(text, min_words=50, max_words=100):
             "Everyone felt cozy and joyful as the day went on.",
             "It was the start of many more wonderful adventures.",
         ]
+
         text = text.rstrip(".!? ") + "."
+
         for sentence in padding_sentences:
             text = text + " " + sentence
             if len(text.split()) >= min_words:
                 break
 
-    return text
+    return finish_sentence(text)
 
 
-def build_prompt(caption):
-    """Build a short story starter for the story model."""
+def build_messages(caption):
+    """Build chat-style instructions for the Qwen instruction model."""
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a children's picture-book writer. "
+                "You only write safe, gentle, cheerful stories for children aged 3 to 10. "
+                "Your stories always have a happy ending."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Write one short story based on this image description:\n"
+                f"{caption}\n\n"
+                "Rules:\n"
+                "- Write only the story.\n"
+                "- Use 50 to 100 words.\n"
+                "- Use simple English for young children.\n"
+                "- Make the story warm, kind, cheerful, and easy to understand.\n"
+                "- End with a happy ending.\n"
+                "- Do not include violence, fear, monsters, revenge, romance, marriage, adult topics, unsafe behavior, or scary content.\n"
+                "- Do not explain the story.\n"
+                "- Do not mention these rules."
+            ),
+        },
+    ]
+
+
+def build_prompt(story_model, caption):
+    """Build the final text prompt for the story pipeline."""
+    messages = build_messages(caption)
+
+    if hasattr(story_model.tokenizer, "apply_chat_template"):
+        return story_model.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
     return (
-        "Children's bedtime story. "
-        f"Picture idea: {caption}. "
-        "The story is gentle, magical, friendly, and happy. "
+        "You are a children's picture-book writer. "
+        "Write only one safe, happy, simple story for children aged 3 to 10. "
+        f"Image description: {caption}. "
+        "The story must be 50 to 100 words, cheerful, kind, and have a happy ending. "
+        "Do not include scary, violent, romantic, adult, or unsafe content. "
         "Story:"
     )
 
 
 def clean_generated_story(text, prompt=""):
-    """Remove prompt echoes, labels, and model comments from generated story text."""
+    """Remove prompt echoes, labels, markdown, and model comments."""
     text = text.replace("\n", " ").strip()
     text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\[\d+\]", "", text)
+    text = re.sub(r"^[\"'“”]+|[\"'“”]+$", "", text).strip()
 
     if prompt and text.lower().startswith(prompt.lower()):
         text = text[len(prompt):].strip()
 
     text = re.sub(
-        r"^(Story:|Your Story:|Children's bedtime story:)\s*",
+        r"^(Story:|Your Story:|Here is the story:|Here is a story:|Sure, here is.*?:)\s*",
         "",
         text,
         flags=re.IGNORECASE,
@@ -276,6 +357,8 @@ def clean_generated_story(text, prompt=""):
         r"\babout\s+\d+\s+words\b.*$",
         r"\bwrite a short\b.*$",
         r"\bmake the story\b.*$",
+        r"\bimage description\b.*$",
+        r"\brules:\b.*$",
     ]
 
     for pattern in comment_patterns:
@@ -286,15 +369,19 @@ def clean_generated_story(text, prompt=""):
     if text:
         text = text[0].upper() + text[1:]
 
-    return text
+    return finish_sentence(text)
 
 
 def is_usable_story(text):
-    """Return True if the story is safe and does not contain prompt-like comments."""
+    """Return True if the story is safe, complete, and not prompt-like."""
+    if not text:
+        return False
+
     if not is_safe_for_kids(text):
         return False
 
     lowered = text.lower()
+
     unwanted_phrases = [
         "this is a great story",
         "this story is suitable",
@@ -303,13 +390,26 @@ def is_usable_story(text):
         "about 80 words",
         "write a short",
         "make the story",
+        "image description",
         "picture idea",
         "prompt",
+        "rules:",
+        "do not include",
+        "do not mention",
+        "adult topics",
     ]
 
     for phrase in unwanted_phrases:
         if phrase in lowered:
             return False
+
+    word_count = count_words(text)
+
+    if word_count < 50 or word_count > 100:
+        return False
+
+    if not text.endswith((".", "!", "?")):
+        return False
 
     return True
 
@@ -327,10 +427,10 @@ def load_caption_model():
 
 @st.cache_resource(show_spinner=False)
 def load_story_model():
-    """Load the story generation pipeline."""
+    """Load the Qwen instruction story-generation pipeline."""
     return pipeline(
         task="text-generation",
-        model="pranavpsv/genre-story-generator-v2",
+        model="Qwen/Qwen2.5-0.5B-Instruct",
     )
 
 
@@ -347,28 +447,27 @@ def make_story(model, caption, max_attempts=4):
     Retries up to max_attempts times if the output is unsafe or not story-like.
     Falls back to a fixed safe story if every attempt fails.
     """
-    prompt = build_prompt(caption)
+    prompt = build_prompt(model, caption)
 
     for _ in range(max_attempts):
         result = model(
             prompt,
-            max_new_tokens=120,
+            max_new_tokens=130,
             do_sample=True,
-            temperature=0.75,
-            top_p=0.9,
-            repetition_penalty=1.25,
+            temperature=0.55,
+            top_p=0.85,
+            repetition_penalty=1.15,
             no_repeat_ngram_size=3,
             return_full_text=False,
             pad_token_id=model.tokenizer.eos_token_id,
+            eos_token_id=model.tokenizer.eos_token_id,
         )
 
         story = result[0]["generated_text"].strip()
         story = clean_generated_story(story, prompt)
         story = trim_to_word_range(story)
 
-        word_count = len(story.split())
-
-        if 50 <= word_count <= 100 and is_usable_story(story):
+        if is_usable_story(story):
             return story
 
     return FALLBACK_STORY
@@ -444,14 +543,17 @@ def main():
         unsafe_allow_html=True,
     )
 
+    # Initialize session state on first load.
     for key in ("image", "story", "audio"):
         if key not in st.session_state:
             st.session_state[key] = None
 
+    # Load both models up front. They're cached, so this only runs once.
     with st.spinner("🌟 Waking up the story magic... (the first time can take a minute) 🌟"):
         caption_model = load_caption_model()
         story_model = load_story_model()
 
+    # Step 1: image upload.
     st.markdown("### 1️⃣ Pick a picture! 📸")
     uploaded = st.file_uploader(
         "Choose a picture",
@@ -460,17 +562,21 @@ def main():
     )
 
     if uploaded is not None:
+        # Convert to RGB so PNGs with transparency don't break BLIP.
         image = Image.open(uploaded).convert("RGB")
         st.session_state.image = image
         st.image(image, caption="Your picture! 🖼️", use_container_width=True)
 
+    # Step 2: generate.
     if st.session_state.image is not None:
         st.markdown("### 2️⃣ Make my story! ✨")
         if st.button("✨ Tell me a story! ✨", key="generate_btn"):
+            # Clear previous results so the UI updates cleanly.
             st.session_state.story = None
             st.session_state.audio = None
             run_pipeline(caption_model, story_model)
 
+    # Step 3 & 4: show the story and the audio.
     if st.session_state.story:
         st.markdown("### 3️⃣ Story time! 📖")
         st.markdown(
@@ -489,6 +595,7 @@ def main():
                 mime="audio/mp3",
             )
 
+        # Replay button: generates a fresh story from the same picture.
         st.markdown("---")
         if st.button("🎁 Tell me a different story!", key="retry_btn"):
             st.session_state.story = None
