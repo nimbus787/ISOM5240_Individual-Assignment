@@ -3,16 +3,15 @@
 
 import io
 import re
-from typing import Tuple
+from typing import Tuple, Optional
 
-import numpy as np
 import streamlit as st
 from PIL import Image
 from transformers import pipeline
 
 
 CAPTION_MODEL_NAME = "Salesforce/blip-image-captioning-base"
-STORY_MODEL_NAME = "google/flan-t5-base"
+STORY_MODEL_NAME = "google/flan-t5-small"
 TTS_MODEL_NAME = "facebook/mms-tts-eng"
 
 MIN_STORY_WORDS = 50
@@ -29,24 +28,33 @@ UNSAFE_WORDS = {
 
 @st.cache_resource
 def load_caption_model():
-    """Load the image captioning model."""
-    return pipeline("image-to-text", model=CAPTION_MODEL_NAME)
+    """Load the image captioning pipeline."""
+    return pipeline(
+        "image-to-text",
+        model=CAPTION_MODEL_NAME
+    )
 
 
 @st.cache_resource
 def load_story_model():
-    """Load the story generation model."""
-    return pipeline("text2text-generation", model=STORY_MODEL_NAME)
+    """Load the story generation pipeline."""
+    return pipeline(
+        "text2text-generation",
+        model=STORY_MODEL_NAME
+    )
 
 
 @st.cache_resource
-def load_tts_model():
-    """Load the text-to-speech model."""
-    return pipeline("text-to-speech", model=TTS_MODEL_NAME)
+def load_audio_model():
+    """Load the text-to-audio pipeline."""
+    return pipeline(
+        "text-to-audio",
+        model=TTS_MODEL_NAME
+    )
 
 
 def count_words(text: str) -> int:
-    """Count words in a text string."""
+    """Count English words in a text string."""
     words = re.findall(r"\b[A-Za-z]+(?:'[A-Za-z]+)?\b", text)
     return len(words)
 
@@ -55,16 +63,23 @@ def clean_text(text: str) -> str:
     """Clean extra spaces and simple unwanted prefixes."""
     text = text.replace("\n", " ").strip()
     text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"^(Story:|Children's story:|Here is a story:)\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"^(Story:|Children's story:|Here is a story:)\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
     return text.strip()
 
 
 def contains_unsafe_content(text: str) -> bool:
     """Check whether the generated text contains unsafe words."""
     lowered_text = text.lower()
+
     for word in UNSAFE_WORDS:
         if re.search(rf"\b{re.escape(word)}\b", lowered_text):
             return True
+
     return False
 
 
@@ -72,6 +87,7 @@ def make_safe_caption(caption: str) -> str:
     """Replace unsafe captions with a general child-friendly scene."""
     if contains_unsafe_content(caption):
         return "a bright and friendly scene"
+
     return caption
 
 
@@ -83,6 +99,7 @@ def trim_story_to_limit(story: str, max_words: int = MAX_STORY_WORDS) -> str:
         return story
 
     trimmed = " ".join(words[:max_words])
+
     last_period = trimmed.rfind(".")
     last_exclamation = trimmed.rfind("!")
     last_question = trimmed.rfind("?")
@@ -95,7 +112,7 @@ def trim_story_to_limit(story: str, max_words: int = MAX_STORY_WORDS) -> str:
 
 
 def build_fallback_story(caption: str) -> str:
-    """Create a safe fallback story if the model output is not suitable."""
+    """Create a safe fallback story if the generated story is not suitable."""
     safe_caption = make_safe_caption(caption)
 
     story = (
@@ -112,26 +129,34 @@ def build_fallback_story(caption: str) -> str:
 
 def generate_caption(image: Image.Image) -> str:
     """Generate a caption from the uploaded image."""
-    caption_model = load_caption_model()
-    result = caption_model(image)
+    try:
+        caption_generator = load_caption_model()
+        caption_output = caption_generator(image)
 
-    if not result or "generated_text" not in result[0]:
+        if not caption_output:
+            return "a bright and friendly scene"
+
+        caption = caption_output[0].get("generated_text", "")
+        caption = clean_text(caption)
+
+        if not caption:
+            return "a bright and friendly scene"
+
+        return make_safe_caption(caption)
+
+    except Exception:
         return "a bright and friendly scene"
-
-    caption = clean_text(result[0]["generated_text"])
-    return make_safe_caption(caption)
 
 
 def generate_story(caption: str) -> str:
-    """Generate a short child-friendly story based on an image caption."""
-    story_model = load_story_model()
+    """Generate a short child-friendly story based on the image caption."""
     safe_caption = make_safe_caption(caption)
 
     prompt = (
         "Write a warm and simple story for children aged 3 to 10. "
-        "The story must be based on this image description: "
+        "Base the story on this image description: "
         f"{safe_caption}. "
-        "Use 50 to 100 words. "
+        "The story must be 50 to 100 words. "
         "Use simple English. "
         "Make the story cheerful, kind, and easy to understand. "
         "The story must have a happy ending. "
@@ -139,22 +164,30 @@ def generate_story(caption: str) -> str:
     )
 
     try:
-        result = story_model(
+        story_generator = load_story_model()
+
+        story_output = story_generator(
             prompt,
-            max_new_tokens=140,
-            min_new_tokens=70,
+            max_length=160,
+            min_length=60,
             do_sample=True,
             temperature=0.8,
             top_p=0.9
         )
 
-        story = clean_text(result[0]["generated_text"])
+        if not story_output:
+            return build_fallback_story(safe_caption)
+
+        story = story_output[0].get("generated_text", "")
+        story = clean_text(story)
         story = trim_story_to_limit(story)
+
+        word_count = count_words(story)
 
         if contains_unsafe_content(story):
             return build_fallback_story(safe_caption)
 
-        if count_words(story) < MIN_STORY_WORDS or count_words(story) > MAX_STORY_WORDS:
+        if word_count < MIN_STORY_WORDS or word_count > MAX_STORY_WORDS:
             return build_fallback_story(safe_caption)
 
         return story
@@ -163,15 +196,19 @@ def generate_story(caption: str) -> str:
         return build_fallback_story(safe_caption)
 
 
-def generate_audio(story: str) -> Tuple[np.ndarray, int]:
-    """Convert the story text into speech audio."""
-    tts_model = load_tts_model()
-    speech_output = tts_model(story)
+def generate_audio(story: str) -> Tuple[Optional[object], Optional[int]]:
+    """Convert the generated story into audio."""
+    try:
+        audio_generator = load_audio_model()
+        speech_output = audio_generator(story)
 
-    audio_array = speech_output["audio"]
-    sample_rate = speech_output["sampling_rate"]
+        audio_array = speech_output["audio"]
+        sample_rate = speech_output["sampling_rate"]
 
-    return audio_array, sample_rate
+        return audio_array, sample_rate
+
+    except Exception:
+        return None, None
 
 
 def show_welcome_message():
@@ -240,9 +277,16 @@ def main():
 
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    st.image(image, caption="Your picture", use_container_width=True)
+    st.image(
+        image,
+        caption="Your picture",
+        use_container_width=True
+    )
 
-    make_story_button = st.button("✨ Make my story", type="primary")
+    make_story_button = st.button(
+        "✨ Make my story",
+        type="primary"
+    )
 
     if make_story_button:
         with st.spinner("🐰 The little bunny detective is looking at your picture..."):
@@ -267,11 +311,20 @@ def main():
         st.markdown("### 📖 Your Happy Story")
         st.write(st.session_state.story)
 
+        word_count = count_words(st.session_state.story)
+        st.caption(f"Story length: {word_count} words")
+
     if st.session_state.audio_array is not None and st.session_state.sample_rate is not None:
         st.markdown("### 🔊 Listen to the Story")
         st.audio(
             st.session_state.audio_array,
             sample_rate=st.session_state.sample_rate
+        )
+
+    elif st.session_state.story:
+        st.warning(
+            "The story is ready, but the audio could not be created this time. "
+            "Please try again in a moment."
         )
 
     st.markdown("---")
