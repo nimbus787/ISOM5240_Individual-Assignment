@@ -51,6 +51,12 @@ WAITING_MESSAGES = {
 
 STAGE_EMOJI = {"caption": "🐻", "story": "🦄", "audio": "🎤"}
 
+STAGE_STEP = {
+    "caption": 1,
+    "story": 2,
+    "audio": 3,
+}
+
 # Words that should not appear in a story for young children.
 UNSAFE_KEYWORDS = [
     "kill", "killed", "killing", "murder", "murdered",
@@ -141,17 +147,39 @@ def inject_css():
             line-height: 1.8;
             color: #4a3f55;
         }
-        .waiting-message {
+        .waiting-card {
+            background: rgba(255, 255, 255, 0.72);
+            border-radius: 25px;
+            padding: 1.6rem;
+            margin: 1rem 0;
+            border: 3px solid #ffd96b;
+            box-shadow: 0 4px 18px rgba(255, 158, 199, 0.25);
             text-align: center;
-            font-family: 'Bubblegum Sans', cursive;
-            font-size: 1.6rem;
-            color: #9f7aea;
-            padding: 1.5rem;
-            animation: bounce 1s infinite alternate;
+            animation: gentle-bounce 1s infinite alternate;
         }
-        @keyframes bounce {
+        .waiting-title {
+            font-family: 'Fredoka', sans-serif;
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: #4a3f55;
+            margin-bottom: 0.8rem;
+        }
+        .waiting-message {
+            font-family: 'Bubblegum Sans', cursive;
+            font-size: 1.7rem;
+            color: #9f7aea;
+            margin-bottom: 0.8rem;
+        }
+        .waiting-step {
+            font-family: 'Fredoka', sans-serif;
+            font-size: 1.15rem;
+            font-weight: 600;
+            color: #4a3f55;
+            letter-spacing: 0.08rem;
+        }
+        @keyframes gentle-bounce {
             from { transform: translateY(0); }
-            to   { transform: translateY(-10px); }
+            to   { transform: translateY(-6px); }
         }
         #MainMenu {visibility: hidden;}
         footer {visibility: hidden;}
@@ -168,7 +196,6 @@ def is_safe_for_kids(text):
     """Return True if no blacklisted word appears in the text as a whole word."""
     text_lower = text.lower()
     for word in UNSAFE_KEYWORDS:
-        # \b word-boundaries avoid false hits like "kill" inside "skill".
         if re.search(r"\b" + re.escape(word) + r"\b", text_lower):
             return False
     return True
@@ -182,7 +209,6 @@ def trim_to_word_range(text, min_words=50, max_words=100):
     """
     words = text.split()
 
-    # Too long: trim back to a clean sentence ending.
     if len(words) > max_words:
         truncated = " ".join(words[:max_words])
         cut_idx = -1
@@ -197,7 +223,6 @@ def trim_to_word_range(text, min_words=50, max_words=100):
         text = truncated
         words = text.split()
 
-    # Too short: stack friendly sentences until we hit the minimum.
     if len(words) < min_words:
         padding_sentences = [
             "They smiled and laughed together under the warm sunshine.",
@@ -216,12 +241,77 @@ def trim_to_word_range(text, min_words=50, max_words=100):
 
 
 def build_prompt(caption):
-    """Build the instruction prompt fed to the story model."""
+    """Build a short story starter for the story model."""
     return (
-        f"Write a short, happy bedtime story for a young child (age 5) about: "
-        f"{caption}. Make the story gentle, magical, and friendly with a happy "
-        f"ending. About 80 words."
+        "Children's bedtime story. "
+        f"Picture idea: {caption}. "
+        "The story is gentle, magical, friendly, and happy. "
+        "Story:"
     )
+
+
+def clean_generated_story(text, prompt=""):
+    """Remove prompt echoes, labels, and model comments from generated story text."""
+    text = text.replace("\n", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+
+    if prompt and text.lower().startswith(prompt.lower()):
+        text = text[len(prompt):].strip()
+
+    text = re.sub(
+        r"^(Story:|Your Story:|Children's bedtime story:)\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    comment_patterns = [
+        r"\bThis is a (great|good|nice|wonderful) story\b.*$",
+        r"\bThis story is (great|good|nice|wonderful|suitable)\b.*$",
+        r"\bThis would be a (great|good|nice|wonderful) story\b.*$",
+        r"\bIt is a (great|good|nice|wonderful) story\b.*$",
+        r"\bfor a young child\b.*$",
+        r"\bfor children\b.*$",
+        r"\bage\s*\d+\b.*$",
+        r"\babout\s+\d+\s+words\b.*$",
+        r"\bwrite a short\b.*$",
+        r"\bmake the story\b.*$",
+    ]
+
+    for pattern in comment_patterns:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+
+    text = text.strip(" -:;,.")
+
+    if text:
+        text = text[0].upper() + text[1:]
+
+    return text
+
+
+def is_usable_story(text):
+    """Return True if the story is safe and does not contain prompt-like comments."""
+    if not is_safe_for_kids(text):
+        return False
+
+    lowered = text.lower()
+    unwanted_phrases = [
+        "this is a great story",
+        "this story is suitable",
+        "for a young child",
+        "age 5",
+        "about 80 words",
+        "write a short",
+        "make the story",
+        "picture idea",
+        "prompt",
+    ]
+
+    for phrase in unwanted_phrases:
+        if phrase in lowered:
+            return False
+
+    return True
 
 
 # ---------- Models (cached so they only load once per session) ----------
@@ -237,10 +327,10 @@ def load_caption_model():
 
 @st.cache_resource(show_spinner=False)
 def load_story_model():
-    """Load the Flan-T5 text-generation pipeline."""
+    """Load the story generation pipeline."""
     return pipeline(
-        task="text2text-generation",
-        model="google/flan-t5-base",
+        task="text-generation",
+        model="pranavpsv/genre-story-generator-v2",
     )
 
 
@@ -251,10 +341,10 @@ def caption_image(model, image):
     return model(image)[0]["generated_text"].strip()
 
 
-def make_story(model, caption, max_attempts=3):
+def make_story(model, caption, max_attempts=4):
     """Generate a kid-friendly story (50-100 words) from an image caption.
 
-    Retries up to max_attempts times if the safety check fails.
+    Retries up to max_attempts times if the output is unsafe or not story-like.
     Falls back to a fixed safe story if every attempt fails.
     """
     prompt = build_prompt(caption)
@@ -262,18 +352,23 @@ def make_story(model, caption, max_attempts=3):
     for _ in range(max_attempts):
         result = model(
             prompt,
-            max_new_tokens=180,
-            min_new_tokens=80,
+            max_new_tokens=120,
             do_sample=True,
-            temperature=0.85,
-            top_p=0.92,
-            repetition_penalty=1.3,
+            temperature=0.75,
+            top_p=0.9,
+            repetition_penalty=1.25,
             no_repeat_ngram_size=3,
+            return_full_text=False,
+            pad_token_id=model.tokenizer.eos_token_id,
         )
+
         story = result[0]["generated_text"].strip()
+        story = clean_generated_story(story, prompt)
         story = trim_to_word_range(story)
 
-        if is_safe_for_kids(story):
+        word_count = len(story.split())
+
+        if 50 <= word_count <= 100 and is_usable_story(story):
             return story
 
     return FALLBACK_STORY
@@ -281,7 +376,6 @@ def make_story(model, caption, max_attempts=3):
 
 def make_audio(text):
     """Convert a story to MP3 audio bytes via gTTS."""
-    # Drop emojis and other non-ASCII so gTTS doesn't try to read them aloud.
     clean = "".join(ch for ch in text if ch.isascii() or ch in " .,!?'\"\n")
 
     tts = gTTS(text=clean, lang="en", tld="com", slow=False)
@@ -294,10 +388,22 @@ def make_audio(text):
 # ---------- UI helpers ----------
 
 def show_waiting(placeholder, stage):
-    """Display a randomly chosen cute waiting message for the given stage."""
+    """Display a clear and cute waiting message for the given stage."""
     msg = random.choice(WAITING_MESSAGES[stage])
+    step = STAGE_STEP[stage]
+
+    dots = ["○", "○", "○"]
+    for i in range(step):
+        dots[i] = "●"
+
     placeholder.markdown(
-        f"<div class='waiting-message'>{STAGE_EMOJI[stage]} {msg}</div>",
+        f"""
+        <div class='waiting-card'>
+            <div class='waiting-title'>⏳ Hold on, please wait...</div>
+            <div class='waiting-message'>{STAGE_EMOJI[stage]} {msg}</div>
+            <div class='waiting-step'>Step {step} of 3&nbsp;&nbsp; {" ".join(dots)}</div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
@@ -338,39 +444,33 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # Initialize session state on first load.
     for key in ("image", "story", "audio"):
         if key not in st.session_state:
             st.session_state[key] = None
 
-    # Load both models up front. They're cached, so this only runs once.
     with st.spinner("🌟 Waking up the story magic... (the first time can take a minute) 🌟"):
         caption_model = load_caption_model()
         story_model = load_story_model()
 
-    # Step 1: image upload.
     st.markdown("### 1️⃣ Pick a picture! 📸")
     uploaded = st.file_uploader(
         "Choose a picture",
         type=["jpg", "jpeg", "png"],
         label_visibility="collapsed",
     )
+
     if uploaded is not None:
-        # Convert to RGB so PNGs with transparency don't break BLIP.
         image = Image.open(uploaded).convert("RGB")
         st.session_state.image = image
         st.image(image, caption="Your picture! 🖼️", use_container_width=True)
 
-    # Step 2: generate.
     if st.session_state.image is not None:
         st.markdown("### 2️⃣ Make my story! ✨")
         if st.button("✨ Tell me a story! ✨", key="generate_btn"):
-            # Clear previous results so the UI updates cleanly.
             st.session_state.story = None
             st.session_state.audio = None
             run_pipeline(caption_model, story_model)
 
-    # Step 3 & 4: show the story and the audio.
     if st.session_state.story:
         st.markdown("### 3️⃣ Story time! 📖")
         st.markdown(
@@ -389,7 +489,6 @@ def main():
                 mime="audio/mp3",
             )
 
-        # Replay button: generates a fresh story from the same picture.
         st.markdown("---")
         if st.button("🎁 Tell me a different story!", key="retry_btn"):
             st.session_state.story = None
