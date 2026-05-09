@@ -14,7 +14,6 @@ from PIL import Image
 from gtts import gTTS
 from transformers import pipeline
 
-
 # ---------- Page config ----------
 st.set_page_config(
     page_title="Magic Story Maker",
