@@ -4,6 +4,7 @@ Magic Story Maker - turns an image into a kid-friendly audio story.
 ISOM5240 Individual Assignment.
 """
 
+import html
 import io
 import random
 import re
@@ -57,7 +58,12 @@ STAGE_STEP = {
     "audio": 3,
 }
 
-# Words and phrases that should not appear in a story for young children.
+STORY_MIN_WORDS = 50
+STORY_MAX_WORDS = 100
+MAX_STORY_ATTEMPTS = 4
+AUDIO_ALLOWED_CHARS = " .,!?'\"\n"
+
+# Words and phrases I do not want in a story for young children.
 UNSAFE_KEYWORDS = [
     "kill", "killed", "killing", "murder", "murdered",
     "blood", "bloody", "gun", "shoot", "shot", "weapon",
@@ -72,6 +78,14 @@ UNSAFE_KEYWORDS = [
     "monster", "monsters", "revenge", "curse", "cursed",
     "black magic", "fall in love", "fell in love", "married", "marry",
     "romance", "romantic",
+]
+
+# Compiling these once keeps the repeated safety checks simple and fast.
+UNSAFE_PATTERNS = [
+    re.compile(re.escape(keyword), re.IGNORECASE)
+    if " " in keyword
+    else re.compile(r"\b" + re.escape(keyword) + r"\b", re.IGNORECASE)
+    for keyword in UNSAFE_KEYWORDS
 ]
 
 # Used if every generation attempt fails the safety check.
@@ -89,7 +103,7 @@ FALLBACK_STORY = (
 # ---------- Styling ----------
 
 def inject_css():
-    """Apply a colorful, kid-friendly look on top of Streamlit's defaults."""
+    """Add the colorful storybook look I want on top of Streamlit."""
     st.markdown(
         """
         <style>
@@ -196,27 +210,17 @@ def inject_css():
 # ---------- Helpers ----------
 
 def is_safe_for_kids(text):
-    """Return True if no blacklisted word or phrase appears in the text."""
-    text_lower = text.lower()
-
-    for word in UNSAFE_KEYWORDS:
-        if " " in word:
-            if word in text_lower:
-                return False
-        else:
-            if re.search(r"\b" + re.escape(word) + r"\b", text_lower):
-                return False
-
-    return True
+    """Small guardrail to keep the generated story kid-safe."""
+    return not any(pattern.search(text) for pattern in UNSAFE_PATTERNS)
 
 
 def count_words(text):
-    """Count words in a generated story."""
+    """Count words the same way for every story check."""
     return len(re.findall(r"\b[A-Za-z]+(?:'[A-Za-z]+)?\b", text))
 
 
 def finish_sentence(text):
-    """Make sure the story ends with a complete sentence."""
+    """Keep the story ending clean, even when the model stops early."""
     text = text.strip()
 
     if not text:
@@ -233,12 +237,8 @@ def finish_sentence(text):
     return text.rstrip(",;: ") + "."
 
 
-def trim_to_word_range(text, min_words=50, max_words=100):
-    """Force the story length into the [min_words, max_words] range.
-
-    If too long, truncate at the last sentence boundary inside the window.
-    If too short, append friendly closing sentences until it is long enough.
-    """
+def trim_to_word_range(text, min_words=STORY_MIN_WORDS, max_words=STORY_MAX_WORDS):
+    """Keep the story inside the target word range without making it feel cut off."""
     text = finish_sentence(text)
     words = text.split()
 
@@ -279,7 +279,7 @@ def trim_to_word_range(text, min_words=50, max_words=100):
 
 
 def build_messages(caption):
-    """Build chat-style instructions for the Qwen instruction model."""
+    """Keep the story request in one place so the model gets consistent rules."""
     return [
         {
             "role": "system",
@@ -309,7 +309,7 @@ def build_messages(caption):
 
 
 def build_prompt(story_model, caption):
-    """Build the final text prompt for the story pipeline."""
+    """Use the model chat template when it is available, otherwise use a plain prompt."""
     messages = build_messages(caption)
 
     if hasattr(story_model.tokenizer, "apply_chat_template"):
@@ -330,7 +330,7 @@ def build_prompt(story_model, caption):
 
 
 def clean_generated_story(text, prompt=""):
-    """Remove prompt echoes, labels, markdown, and model comments."""
+    """Clean away prompt echoes, labels, markdown, and model comments."""
     text = text.replace("\n", " ").strip()
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"\[\d+\]", "", text)
@@ -373,7 +373,7 @@ def clean_generated_story(text, prompt=""):
 
 
 def is_usable_story(text):
-    """Return True if the story is safe, complete, and not prompt-like."""
+    """Final check before I show the story in the app."""
     if not text:
         return False
 
@@ -418,7 +418,7 @@ def is_usable_story(text):
 
 @st.cache_resource(show_spinner=False)
 def load_caption_model():
-    """Load the BLIP image-captioning pipeline."""
+    """Load the BLIP image-captioning pipeline once per session."""
     return pipeline(
         task="image-to-text",
         model="Salesforce/blip-image-captioning-base",
@@ -427,7 +427,7 @@ def load_caption_model():
 
 @st.cache_resource(show_spinner=False)
 def load_story_model():
-    """Load the Qwen instruction story-generation pipeline."""
+    """Load the Qwen story-generation pipeline once per session."""
     return pipeline(
         task="text-generation",
         model="Qwen/Qwen2.5-0.5B-Instruct",
@@ -437,16 +437,12 @@ def load_story_model():
 # ---------- Pipeline ----------
 
 def caption_image(model, image):
-    """Generate a one-line description of the image."""
+    """Turn the uploaded picture into a short caption."""
     return model(image)[0]["generated_text"].strip()
 
 
-def make_story(model, caption, max_attempts=4):
-    """Generate a kid-friendly story (50-100 words) from an image caption.
-
-    Retries up to max_attempts times if the output is unsafe or not story-like.
-    Falls back to a fixed safe story if every attempt fails.
-    """
+def make_story(model, caption, max_attempts=MAX_STORY_ATTEMPTS):
+    """Generate a kid-friendly story from the caption and fall back if needed."""
     prompt = build_prompt(model, caption)
 
     for _ in range(max_attempts):
@@ -474,8 +470,8 @@ def make_story(model, caption, max_attempts=4):
 
 
 def make_audio(text):
-    """Convert a story to MP3 audio bytes via gTTS."""
-    clean = "".join(ch for ch in text if ch.isascii() or ch in " .,!?'\"\n")
+    """Convert the final story into MP3 audio bytes."""
+    clean = "".join(ch for ch in text if ch.isascii() or ch in AUDIO_ALLOWED_CHARS)
 
     tts = gTTS(text=clean, lang="en", tld="com", slow=False)
     buf = io.BytesIO()
@@ -487,7 +483,7 @@ def make_audio(text):
 # ---------- UI helpers ----------
 
 def show_waiting(placeholder, stage):
-    """Display a clear and cute waiting message for the given stage."""
+    """Show one cute waiting card for the current pipeline stage."""
     msg = random.choice(WAITING_MESSAGES[stage])
     step = STAGE_STEP[stage]
 
@@ -508,7 +504,7 @@ def show_waiting(placeholder, stage):
 
 
 def run_pipeline(caption_model, story_model):
-    """Run caption -> story -> audio and stash the results in session_state."""
+    """Run caption, story, and audio steps, then save the results in session state."""
     placeholder = st.empty()
 
     try:
@@ -532,7 +528,7 @@ def run_pipeline(caption_model, story_model):
 # ---------- Main ----------
 
 def main():
-    """Top-level Streamlit page."""
+    """Build the Streamlit page."""
     inject_css()
 
     st.markdown("# 🦄 Magic Story Maker 🌈")
@@ -579,9 +575,10 @@ def main():
     # Step 3 & 4: show the story and the audio.
     if st.session_state.story:
         st.markdown("### 3️⃣ Story time! 📖")
+        safe_story = html.escape(st.session_state.story)
         st.markdown(
             f"<div class='story-box'>📖 <b>Your Story:</b><br><br>"
-            f"{st.session_state.story}</div>",
+            f"{safe_story}</div>",
             unsafe_allow_html=True,
         )
 
@@ -595,12 +592,6 @@ def main():
                 mime="audio/mp3",
             )
 
-        # Replay button: generates a fresh story from the same picture.
-        st.markdown("---")
-        if st.button("🎁 Tell me a different story!", key="retry_btn"):
-            st.session_state.story = None
-            st.session_state.audio = None
-            run_pipeline(caption_model, story_model)
 
 
 if __name__ == "__main__":
